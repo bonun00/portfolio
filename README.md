@@ -1,8 +1,5 @@
 # 포트폴리오
 
-Java/Spring Boot 백엔드 개발자입니다.
-공공 API와 LLM처럼 **내가 통제할 수 없는 외부 시스템**을 서비스에 안정적으로 붙이는 일에 관심이 있습니다.
-
 | 프로젝트 | 설명 | 형태 | |
 |---|---|---|---|
 | [**Bustory**](#1-bustory--군-지역-버스-정보-서비스) | 정보 접근성이 낮은 군 지역의 버스 시간표·실시간 도착정보 | 개인 · **운영 중** | [🔗 bustory.kr](https://bustory.kr) |
@@ -21,7 +18,7 @@ Java/Spring Boot 백엔드 개발자입니다.
 
 # 1. Bustory — 군 지역 버스 정보 서비스
 
-<img width="40%" alt="Bustory 메인 화면" src="https://github.com/user-attachments/assets/0e25e1c2-8aac-4ff2-82cc-7c4cefbb5141" />
+<img width="823" height="649" alt="image" src="https://github.com/user-attachments/assets/4ab73dc5-5061-47e0-9419-b1ac841b370d" />
 
 > **"함안, 마산 등 버스 정보가 부족한 군 지역 주민들을 위한 맞춤형 실시간 버스 정보 서비스"**
 >
@@ -133,6 +130,7 @@ if (prev != null && prev.arrTime() == arrTime) {
 ---
 
 # 2. Feelio — AI 감정 일기 서비스
+<img width="823" height="649" alt="image" src="https://github.com/user-attachments/assets/23ac38cf-1d97-458a-923f-69b59587e0b1" />
 
 > **음성으로 기록하고, AI가 감정을 분석해 맞춤형 피드백을 제공하는 감정 일기 서비스**
 
@@ -167,10 +165,14 @@ if (prev != null && prev.arrTime() == arrTime) {
 기존 함수는 코사인 거리(`<=>`)를 유사도로 변환한 뒤, 그 값으로 필터링과 정렬을 수행했다.
 
 ```sql
-SELECT ..., (1 - (d.embedding <=> query_embedding))::float AS sim
-FROM diary d LEFT JOIN ai_analysis a ON d.id = a.diary_id
-WHERE d.user_id = p_user_id
-...
+SELECT sub.id, sub.content, sub.emotion, sub.created_at, sub.sim AS similarity
+FROM (
+  SELECT d.id, d.content, a.emotion::varchar AS emotion, d.created_at,
+         (1 - (d.embedding <=> query_embedding))::float AS sim
+  FROM diary d
+  LEFT JOIN ai_analysis a ON d.id = a.diary_id
+  WHERE d.user_id = p_user_id
+) sub
 WHERE sub.sim >= match_threshold
 ORDER BY sub.sim DESC
 LIMIT match_count;
@@ -179,6 +181,61 @@ LIMIT match_count;
 pgvector 인덱스는 **`ORDER BY 벡터컬럼 <=> 기준벡터` 형태일 때만** 동작한다. `1 - 거리`로 변환하면 플래너가 이를 일반 표현식으로 취급해 인덱스를 사용하지 못한다. 결과적으로 전체 행의 거리를 계산한 뒤 정렬하는 구조가 된다.
 
 결과 자체는 정확했고 데이터가 적을 때는 성능 문제도 드러나지 않아, 실행 계획을 확인하기 전까지는 발견되지 않았다.
+
+### 해결
+ 
+연산 순서를 바꾸는 것이 핵심이다. 기존은 *전부 계산 → 필터 → 정렬 → 자르기* 순서였고, 개선안은 *인덱스로 자르기 → 조인 → 필터* 순서다.
+ 
+<table class="sqlcmp">
+    
+<tr><th>기존 — 전체 스캔</th ><th>개선 — 인덱스 사용</th></tr>
+<tr><td>
+    
+```sql
+    
+SELECT sub.id, sub.content, sub.emotion,
+       sub.created_at, sub.sim AS similarity
+FROM (
+  SELECT d.id, d.content, d.created_at,
+         a.emotion::varchar AS emotion,
+         (1 - (d.embedding <=> query_embedding))
+           ::float AS sim
+  FROM diary d
+  LEFT JOIN ai_analysis a
+         ON d.id = a.diary_id
+  WHERE d.user_id = p_user_id
+) sub
+WHERE sub.sim >= match_threshold
+ORDER BY sub.sim DESC
+LIMIT match_count;
+```
+ 
+전체 행의 `sim`을 계산한 뒤 그 값으로 정렬한다. 플래너가 벡터 인덱스를 사용하지 못한다.
+ 
+</td><td>
+    
+```sql
+    
+SELECT sub.*, a.emotion::varchar
+FROM (
+  SELECT d.id, d.content, d.created_at,
+         1 - (d.embedding <=> query_embedding)
+           AS sim
+  FROM diary d
+  WHERE d.user_id = p_user_id
+  ORDER BY d.embedding <=> query_embedding
+  LIMIT match_count
+) sub
+LEFT JOIN ai_analysis a
+       ON sub.id = a.diary_id
+WHERE sub.sim >= match_threshold;
+```
+ 
+거리 기준으로 정렬해 인덱스로 상위 N건만 읽는다. 조인과 임계값 필터는 추려낸 행에만 적용된다.
+ 
+</td></tr>
+</table>
+유사도(`1 - 거리`)는 표시용으로만 계산하고, 정렬은 거리 기준으로 수행한다.
 
 ### 검증
 
@@ -203,26 +260,8 @@ Execution Time: 0.750 ms
 
 전체 5,000건을 읽던 것이 3건으로 줄었다.
 
-### 해결
-
-연산 순서를 바꾸는 것이 핵심이다. 기존은 *전부 계산 → 필터 → 정렬 → 자르기* 순서였고, 개선안은 *인덱스로 자르기 → 조인 → 필터* 순서다.
-
-```sql
-SELECT sub.*, a.emotion::varchar
-FROM (
-  SELECT d.id, d.content, d.created_at,
-         1 - (d.embedding <=> query_embedding) AS sim
-  FROM diary d
-  WHERE d.user_id = p_user_id
-  ORDER BY d.embedding <=> query_embedding   -- 거리 기준: 인덱스 사용
-  LIMIT match_count
-) sub
-LEFT JOIN ai_analysis a ON sub.id = a.diary_id
-WHERE sub.sim >= match_threshold;             -- 추려낸 소수 행에만 적용
-```
-
-유사도(`1 - 거리`)는 표시용으로만 계산하고, 정렬은 거리 기준으로 수행한다. 임계값 필터도 인덱스로 추려낸 행에만 적용되어 인덱스 사용을 방해하지 않는다.
-
 ### 배운 것
 
-**생성된 코드는 동작 여부만으로 검증되지 않는다.** 이후로는 데이터 접근 쿼리에 대해 `EXPLAIN ANALYZE`로 실행 계획을 확인하는 것을 기본 절차로 삼았다.
+전체 5,000건을 읽던 것이 3건으로 줄었다. 현재 데이터 규모에서는 인덱스 없이도 실용적인 응답 속도가 나오지만, 기존 구조는 인덱스를 추가해도 효과가 없어 데이터가 증가했을 때 대응할 수 없다는 점이 문제였다.
+ 
+**생성된 코드는 동작 여부만으로 검증되지 않는다.** 결과가 정확하고 응답이 빨라도 구조적 한계는 남아 있을 수 있다. 이후로는 데이터 접근 쿼리에 대해 `EXPLAIN ANALYZE`로 실행 계획을 확인하는 것을 기본 절차로 삼았다.
